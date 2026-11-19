@@ -70,6 +70,9 @@
   /* chord readout: fixed height, name auto-shrinks to fit one line */
   #chordCard { flex: none; height: 132px; padding: 10px 14px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }
   #chordCard.held #chordName { opacity: .5; }
+  #chordCard { cursor: pointer; transition: border-color .2s; }
+  #chordCard.frozen { border-color: #38bdf8; }
+  #badge.frozen { color: #38bdf8; }
   #chordName {
     height: 76px; display: flex; align-items: center; white-space: nowrap; overflow: hidden;
     font-family: Fraunces, 'Noto Music', Georgia, serif; font-weight: 700; line-height: 1; font-size: 72px;
@@ -334,9 +337,10 @@
     const name = $('chordName');
     const card = $('chordCard');
     card.classList.toggle('held', !!(show && show.held && !viewing));
-    $('badge').textContent = viewing ? 'from history' : (show && show.held ? 'last chord' : (listening ? 'live' : ''));
+    $('badge').textContent = frozen ? 'frozen · tap to unfreeze' : viewing ? 'from history' : (show && show.held ? 'last chord' : (listening ? 'live' : ''));
     const badge = $('badge');
-    badge.className = !viewing && show && !show.held && listening ? 'live' : '';
+    badge.className = frozen ? 'frozen' : !viewing && show && !show.held && listening ? 'live' : '';
+    card.classList.toggle('frozen', frozen);
     if (!r) {
       name.className = 'empty';
       name.textContent = listening ? 'Listening…' : 'Tap Listen, then play';
@@ -478,6 +482,9 @@
   // ---------- audio ----------
   let listening = false, actx = null, stream = null, analyser = null, det = null, tracker = null, timer = null, buf = null, wakeLock = null;
   let lastKey = '';
+  let frozen = false;                 // tap the chord to freeze the display
+  let noise = 0, noiseFrames = 0;     // running estimate of the room's background level
+  let loudHist = [], startedAt = 0;   // for the "mic level is low" hint
 
   function sensParams() {
     const s = S.sens / 100;
@@ -501,6 +508,9 @@
       stop();
       return;
     }
+    noise = 0; noiseFrames = 0; loudHist = []; startedAt = Date.now();
+    actx.onstatechange = () => { if (listening && actx && actx.state !== 'running' && actx.state !== 'closed') actx.resume().catch(() => {}); };
+    stream.getAudioTracks().forEach(t => { t.onended = () => { if (listening) { stop(); toast('The microphone was interrupted. Tap Listen to start again.'); } }; });
     const src = actx.createMediaStreamSource(stream);
     analyser = actx.createAnalyser();
     analyser.fftSize = 8192;
@@ -542,17 +552,29 @@
     let cr = 0;
     for (let i = buf.length - hop; i < buf.length; i++) cr += buf[i] * buf[i];
     cr = Math.sqrt(cr / hop);
-    const res = det.process(buf);
+    // adapt to the room: follow the quiet level quickly downward, slowly upward
+    if (noiseFrames < 10) { noise = noiseFrames ? Math.min(noise, cr) : cr; noiseFrames++; }
+    else if (cr < noise * 1.6) noise = noise * 0.95 + cr * 0.05;
+    else noise *= 1.003;
     const sp = sensParams();
-    const picked = res.rms > sp.gate ? PianoDetect.pickNotes(det, res, { rel: sp.rel }) : [];
+    const gate = Math.max(sp.gate, noise * 3);
+    tracker.o.gate = gate;
+    const res = det.process(buf);
+    const picked = res.rms > gate ? PianoDetect.pickNotes(det, res, { rel: sp.rel }) : [];
     const out = tracker.update(cr, picked, det);
     // level meter (dB scaled)
     const db = 20 * Math.log10(res.rms + 1e-9);
     $('meter').style.width = Math.max(0, Math.min(100, (db + 60) * 2)) + '%';
+    loudHist.push(res.rms); if (loudHist.length > 100) loudHist.shift();
+    if (!current && !frozen && Date.now() - startedAt > 6000) {
+      const peak = Math.max(...loudHist);
+      $('desc').textContent = peak < gate ? 'Not hearing much. Move the phone closer to the piano speakers, or raise Sensitivity.' : 'Play a chord and let it ring for a moment.';
+    }
     feed(out.notes, out.fresh);
   }
 
   function feed(notes, fresh) {
+    if (frozen) return;
     const key = notes.join(',');
     if (!notes.length) {
       if (current && !current.held) {
@@ -589,6 +611,13 @@
   });
 
   $('listen').addEventListener('click', () => (listening ? stop() : start()));
+  // tap the chord to freeze it on screen; tap again to go back to live
+  $('chordCard').addEventListener('click', () => {
+    if (!current && !frozen) return;
+    frozen = !frozen;
+    if (!frozen) lastKey = '';
+    render();
+  });
 
   // ---------- toast ----------
   let toastT = null;
